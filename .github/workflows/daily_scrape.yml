@@ -1,0 +1,38 @@
+name: 每日抓取ETF持股並更新網站
+
+on:
+  schedule:
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取出程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 執行爬蟲
+        run: python scraper.py
+
+      - name: 產生換股報告
+        run: python diff_report.py --md report_latest.md
+
+      - name: 產生網站
+        run: python generate_site.py
+
+      - name: 提交更新後的資料庫與網站
+        run: |
+          git config user.name "etf-bot"
+          git config user.email "etf-bot@users.noreply.github.com"
+          git add data/etf_holdings.db report_latest.md docs/index.html
+          git commit -m "每日更新: $(date +'%Y-%m-%d')" || echo "沒有變動"
+          git push
