@@ -34,7 +34,14 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Referer": "https://www.moneydj.com/",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
 }
+
+# 用同一個session發送所有請求，行為更接近瀏覽器（正確處理cookie），
+# 也比每次都開新連線更不容易被誤判成快取／機器人流量
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # 抓取間隔秒數，避免對網站造成負擔（請勿調得過短）
 REQUEST_DELAY_SEC = 3
@@ -86,61 +93,6 @@ def init_db(conn: sqlite3.Connection):
         """
     )
     conn.commit()
-
-
-def parse_holdings_page(html: str):
-    """從頁面HTML解析出資料日期與持股明細表格"""
-    # 資料日期，例如「資料日期：2026/05/14」
-    m = re.search(r"資料日期[：:]\s*(\d{4}/\d{2}/\d{2})", html)
-    snapshot_date = m.group(1).replace("/", "-") if m else date.today().isoformat()
-
-    tables = pd.read_html(StringIO(html))
-    holdings_df = None
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        if any("個股名稱" in c for c in cols) and any("投資比例" in c for c in cols):
-            holdings_df = t
-            break
-
-    if holdings_df is None:
-        raise ValueError("找不到持股明細表格，網站結構可能已變動，請檢查程式")
-
-    holdings_df = holdings_df.rename(
-        columns=lambda c: {
-            "個股名稱": "raw_name",
-        }.get(str(c).split("(")[0].strip(), str(c))
-    )
-
-    records = []
-    for _, row in holdings_df.iterrows():
-        raw_name = str(row.iloc[0])
-        # 格式類似「台積電(2330.TW)」，取出代碼與名稱
-        code_match = re.search(r"\((\d{4,6})\.TW\)", raw_name)
-        stock_code = code_match.group(1) if code_match else ""
-        stock_name = re.sub(r"\(\d{4,6}\.TW\)", "", raw_name).strip()
-
-        try:
-            weight = float(row.iloc[1])
-        except (ValueError, TypeError):
-            weight = None
-        try:
-            shares = float(str(row.iloc[2]).replace(",", ""))
-        except (ValueError, TypeError):
-            shares = None
-
-        if not stock_code:
-            continue
-
-        records.append(
-            {
-                "stock_code": stock_code,
-                "stock_name": stock_name,
-                "weight_pct": weight,
-                "shares": shares,
-            }
-        )
-
-    return snapshot_date, records
 
 
 def _html_to_text(html: str) -> str:
@@ -204,9 +156,9 @@ def parse_fund_info(html: str) -> dict:
 
 
 def fetch_fund_info(etf_id: str) -> dict | None:
-    url = FUND_INFO_URL_TEMPLATE.format(etf_id=etf_id)
+    url = FUND_INFO_URL_TEMPLATE.format(etf_id=etf_id) + f"&_ts={int(time.time())}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = SESSION.get(url, timeout=15)
         resp.raise_for_status()
         resp.encoding = "utf-8"
     except requests.RequestException as e:
@@ -248,9 +200,9 @@ def save_fund_info(conn: sqlite3.Connection, etf_id: str, info: dict):
 
 
 def fetch_one(etf_id: str) -> tuple[str, list[dict]] | None:
-    url = URL_TEMPLATE.format(etf_id=etf_id)
+    url = URL_TEMPLATE.format(etf_id=etf_id) + f"&_ts={int(time.time())}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = SESSION.get(url, timeout=15)
         resp.raise_for_status()
         resp.encoding = "utf-8"
     except requests.RequestException as e:
@@ -264,6 +216,61 @@ def fetch_one(etf_id: str) -> tuple[str, list[dict]] | None:
         return None
 
     log.info("%s：資料日期 %s，共 %d 檔持股", etf_id, snapshot_date, len(records))
+    return snapshot_date, records
+
+
+def parse_holdings_page(html: str):
+    """從頁面HTML解析出資料日期與持股明細表格"""
+    # 資料日期，例如「資料日期：2026/05/14」
+    m = re.search(r"資料日期[：:]\s*(\d{4}/\d{2}/\d{2})", html)
+    snapshot_date = m.group(1).replace("/", "-") if m else date.today().isoformat()
+
+    tables = pd.read_html(StringIO(html))
+    holdings_df = None
+    for t in tables:
+        cols = [str(c) for c in t.columns]
+        if any("個股名稱" in c for c in cols) and any("投資比例" in c for c in cols):
+            holdings_df = t
+            break
+
+    if holdings_df is None:
+        raise ValueError("找不到持股明細表格，網站結構可能已變動，請檢查程式")
+
+    holdings_df = holdings_df.rename(
+        columns=lambda c: {
+            "個股名稱": "raw_name",
+        }.get(str(c).split("(")[0].strip(), str(c))
+    )
+
+    records = []
+    for _, row in holdings_df.iterrows():
+        raw_name = str(row.iloc[0])
+        # 格式類似「台積電(2330.TW)」，取出代碼與名稱
+        code_match = re.search(r"\((\d{4,6})\.TW\)", raw_name)
+        stock_code = code_match.group(1) if code_match else ""
+        stock_name = re.sub(r"\(\d{4,6}\.TW\)", "", raw_name).strip()
+
+        try:
+            weight = float(row.iloc[1])
+        except (ValueError, TypeError):
+            weight = None
+        try:
+            shares = float(str(row.iloc[2]).replace(",", ""))
+        except (ValueError, TypeError):
+            shares = None
+
+        if not stock_code:
+            continue
+
+        records.append(
+            {
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "weight_pct": weight,
+                "shares": shares,
+            }
+        )
+
     return snapshot_date, records
 
 
@@ -294,6 +301,13 @@ def main():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
+
+    # 先訪問首頁一次，讓session跟真實瀏覽器一樣拿到正常的cookie，
+    # 避免網站對「沒有cookie的直接請求」回傳快取過的舊內容
+    try:
+        SESSION.get("https://www.moneydj.com/", timeout=15)
+    except requests.RequestException as e:
+        log.warning("預熱首頁請求失敗（不影響後續抓取）：%s", e)
 
     etf_codes = load_etf_list()
     log.info("共 %d 檔ETF待抓取", len(etf_codes))
